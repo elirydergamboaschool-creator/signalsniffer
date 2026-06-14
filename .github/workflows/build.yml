@@ -3,7 +3,6 @@ name: Build Signal Scanner FAP
 on:
   push:
     branches: [main, master]
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -11,15 +10,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Build FAP with ufbt
-        uses: nicowillis/build-flipper-application-package@v1
-        with:
-          app-dir: .
+      - name: Install ufbt
+        run: pip install ufbt
 
-      - name: Upload .fap as artifact
+      - name: Build FAP
+        run: ufbt
+
+      - name: Upload FAP
         uses: actions/upload-artifact@v4
         with:
           name: signal_scanner.fap
