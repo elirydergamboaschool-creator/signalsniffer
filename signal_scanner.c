@@ -124,3 +124,140 @@ static void wifi_scan_start(App* app) {
 static void ble_scan_tick(App* app) {
     BleAdRecord rec;
     if(furi_hal_bt_get_ad
+    infrared_worker_alloc();
+    infrared_worker_rx_set_received_signal_callback(
+        app->ir_worker, ir_received_callback, app);
+    infrared_worker_rx_start(app->ir_worker);
+}
+
+static bool scene_infrared_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context); UNUSED(event); return false;
+}
+
+static void scene_infrared_on_exit(void* context) {
+    App* app = context;
+    if(app->ir_worker) {
+        infrared_worker_rx_stop(app->ir_worker);
+        infrared_worker_free(app->ir_worker);
+        app->ir_worker = NULL;
+    }
+}
+
+static void scene_ble_on_enter(void* context) {
+    App* app = context;
+    furi_string_reset(app->ble_log);
+    furi_string_cat_str(app->ble_log, "-- BLE Scanning --\n\n");
+    text_box_set_text(app->text_box, furi_string_get_cstr(app->ble_log));
+    text_box_set_font(app->text_box, TextBoxFontText);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewTextBox);
+    furi_hal_bt_start_adv_scan();
+}
+
+static bool scene_ble_on_event(void* context, SceneManagerEvent event) {
+    App* app = context;
+    UNUSED(event);
+    ble_scan_tick(app);
+    return false;
+}
+
+static void scene_ble_on_exit(void* context) {
+    UNUSED(context);
+    furi_hal_bt_stop_adv_scan();
+}
+
+static void scene_wifi_on_enter(void* context) {
+    App* app = context;
+    furi_string_reset(app->wifi_log);
+    furi_string_cat_str(app->wifi_log, "-- WiFi Scan --\nRequesting ESP32...\n");
+    text_box_set_text(app->text_box, furi_string_get_cstr(app->wifi_log));
+    text_box_set_font(app->text_box, TextBoxFontText);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewTextBox);
+    wifi_scan_start(app);
+}
+
+static bool scene_wifi_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context); UNUSED(event); return false;
+}
+
+static void scene_wifi_on_exit(void* context) { UNUSED(context); }
+
+static const SceneManagerHandlers scene_handlers = {
+    .on_enter_handlers = {
+        [SceneMain]      = scene_main_on_enter,
+        [SceneSubGHz]    = scene_subghz_on_enter,
+        [SceneInfrared]  = scene_infrared_on_enter,
+        [SceneBluetooth] = scene_ble_on_enter,
+        [SceneWiFi]      = scene_wifi_on_enter,
+    },
+    .on_event_handlers = {
+        [SceneMain]      = scene_main_on_event,
+        [SceneSubGHz]    = scene_subghz_on_event,
+        [SceneInfrared]  = scene_infrared_on_event,
+        [SceneBluetooth] = scene_ble_on_event,
+        [SceneWiFi]      = scene_wifi_on_event,
+    },
+    .on_exit_handlers = {
+        [SceneMain]      = scene_main_on_exit,
+        [SceneSubGHz]    = scene_subghz_on_exit,
+        [SceneInfrared]  = scene_infrared_on_exit,
+        [SceneBluetooth] = scene_ble_on_exit,
+        [SceneWiFi]      = scene_wifi_on_exit,
+    },
+    .scene_num = SceneCount,
+};
+
+static bool nav_callback(void* context) {
+    App* app = context;
+    return scene_manager_handle_back_event(app->scene_manager);
+}
+
+static void submenu_callback(void* context, uint32_t index) {
+    App* app = context;
+    scene_manager_handle_custom_event(app->scene_manager, index);
+}
+
+static App* app_alloc(void) {
+    App* app = malloc(sizeof(App));
+    app->scene_manager   = scene_manager_alloc(&scene_handlers, app);
+    app->view_dispatcher = view_dispatcher_alloc();
+    view_dispatcher_enable_queue(app->view_dispatcher);
+    view_dispatcher_set_navigation_event_callback(app->view_dispatcher, nav_callback, app);
+    app->submenu = submenu_alloc();
+    submenu_set_callback(app->submenu, submenu_callback, app);
+    view_dispatcher_add_view(app->view_dispatcher, ViewSubmenu, submenu_get_view(app->submenu));
+    app->text_box = text_box_alloc();
+    view_dispatcher_add_view(app->view_dispatcher, ViewTextBox, text_box_get_view(app->text_box));
+    app->subghz_log = furi_string_alloc();
+    app->ir_log     = furi_string_alloc();
+    app->ble_log    = furi_string_alloc();
+    app->wifi_log   = furi_string_alloc();
+    app->subghz_worker = NULL;
+    app->ir_worker     = NULL;
+    return app;
+}
+
+static void app_free(App* app) {
+    view_dispatcher_remove_view(app->view_dispatcher, ViewSubmenu);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewTextBox);
+    submenu_free(app->submenu);
+    text_box_free(app->text_box);
+    view_dispatcher_free(app->view_dispatcher);
+    scene_manager_free(app->scene_manager);
+    furi_string_free(app->subghz_log);
+    furi_string_free(app->ir_log);
+    furi_string_free(app->ble_log);
+    furi_string_free(app->wifi_log);
+    free(app);
+}
+
+int32_t signal_scanner_app(void* p) {
+    UNUSED(p);
+    App* app = app_alloc();
+    Gui* gui = furi_record_open(RECORD_GUI);
+    view_dispatcher_attach_to_gui(app->view_dispatcher, gui, ViewDispatcherTypeFullscreen);
+    scene_manager_next_scene(app->scene_manager, SceneMain);
+    view_dispatcher_run(app->view_dispatcher);
+    furi_record_close(RECORD_GUI);
+    app_free(app);
+    return 0;
+}
