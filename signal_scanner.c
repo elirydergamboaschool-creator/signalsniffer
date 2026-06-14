@@ -4,29 +4,22 @@
 #include <gui/scene_manager.h>
 #include <gui/modules/submenu.h>
 #include <gui/modules/text_box.h>
-#include <gui/modules/widget.h>
 #include <notification/notification_messages.h>
 #include <lib/subghz/subghz_setting.h>
-#include <lib/subghz/receiver.h>
-#include <lib/subghz/transmitter.h>
 #include <lib/subghz/subghz_worker.h>
 #include <infrared_worker.h>
-#include <bt/bt_service/bt.h>
 #include <furi_hal_infrared.h>
 #include <furi_hal_subghz.h>
-#include <furi_hal_bt.h>
+#include <furi_hal_serial.h>
 #include <string.h>
 #include <stdio.h>
 
-#define MAX_SIGNALS 32
-#define MAX_SIG_LEN 64
 #define TAG "SignalScanner"
 
 typedef enum {
     SceneMain,
     SceneSubGHz,
     SceneInfrared,
-    SceneBluetooth,
     SceneWiFi,
     SceneCount,
 } SceneId;
@@ -34,21 +27,18 @@ typedef enum {
 typedef enum {
     ViewSubmenu,
     ViewTextBox,
-    ViewCount,
 } ViewId;
 
 typedef struct {
-    SceneManager*    scene_manager;
-    ViewDispatcher*  view_dispatcher;
-    Submenu*         submenu;
-    TextBox*         text_box;
-    SubGhzWorker*    subghz_worker;
-    FuriString*      subghz_log;
-    InfraredWorker*  ir_worker;
-    FuriString*      ir_log;
-    FuriString*      ble_log;
-    FuriString*      wifi_log;
-    SceneId          active_scan;
+    SceneManager* scene_manager;
+    ViewDispatcher* view_dispatcher;
+    Submenu* submenu;
+    TextBox* text_box;
+    SubGhzWorker* subghz_worker;
+    FuriString* subghz_log;
+    InfraredWorker* ir_worker;
+    FuriString* ir_log;
+    FuriString* wifi_log;
 } App;
 
 static void subghz_rx_callback(SubGhzWorker* worker, void* context) {
@@ -70,39 +60,41 @@ static void subghz_rx_callback(SubGhzWorker* worker, void* context) {
 
 static void ir_received_callback(void* context, InfraredWorkerSignal* received_signal) {
     App* app = context;
+    char buf[64];
     if(infrared_worker_signal_is_decoded(received_signal)) {
         const InfraredMessage* msg = infrared_worker_get_decoded_signal(received_signal);
-        char buf[MAX_SIG_LEN];
         snprintf(buf, sizeof(buf), "[IR] %s addr=0x%lX cmd=0x%lX\n",
             infrared_get_protocol_name(msg->protocol),
             (unsigned long)msg->address,
             (unsigned long)msg->command);
-        furi_string_cat_str(app->ir_log, buf);
     } else {
         const uint32_t* timings;
-        size_t timings_cnt;
-        infrared_worker_get_raw_signal(received_signal, &timings, &timings_cnt);
-        char buf[MAX_SIG_LEN];
-        snprintf(buf, sizeof(buf), "[IR-RAW] %zu pulses\n", timings_cnt);
-        furi_string_cat_str(app->ir_log, buf);
+        size_t cnt;
+        infrared_worker_get_raw_signal(received_signal, &timings, &cnt);
+        snprintf(buf, sizeof(buf), "[IR-RAW] %zu pulses\n", cnt);
     }
+    furi_string_cat_str(app->ir_log, buf);
     if(furi_string_size(app->ir_log) > 2048)
         furi_string_left(app->ir_log, 2048);
     text_box_set_text(app->text_box, furi_string_get_cstr(app->ir_log));
 }
 
 static void wifi_scan_start(App* app) {
-    furi_hal_serial_init(FuriHalSerialIdUsart, 115200);
+    FuriHalSerialHandle* handle = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
+    if(!handle) {
+        furi_string_cat_str(app->wifi_log, "Serial unavailable\n");
+        text_box_set_text(app->text_box, furi_string_get_cstr(app->wifi_log));
+        return;
+    }
+    furi_hal_serial_init(handle, 115200);
     const char* cmd = "SCAN\n";
-    furi_hal_serial_tx(FuriHalSerialIdUsart, (const uint8_t*)cmd, strlen(cmd));
-    furi_string_reset(app->wifi_log);
-    furi_string_cat_str(app->wifi_log, "-- WiFi Scan (ESP32) --\n");
+    furi_hal_serial_tx(handle, (const uint8_t*)cmd, strlen(cmd));
     uint32_t deadline = furi_get_tick() + furi_ms_to_ticks(3000);
     char line[128];
     size_t pos = 0;
     while(furi_get_tick() < deadline) {
         uint8_t byte = 0;
-        if(furi_hal_serial_rx(FuriHalSerialIdUsart, &byte, 1, 10)) {
+        if(furi_hal_serial_rx(handle, &byte, 1, 10)) {
             if(byte == '\n' || pos >= sizeof(line) - 1) {
                 line[pos] = '\0';
                 if(pos > 0) {
@@ -117,23 +109,79 @@ static void wifi_scan_start(App* app) {
     }
     if(furi_string_size(app->wifi_log) <= 24)
         furi_string_cat_str(app->wifi_log, "(no response - check board)\n");
-    furi_hal_serial_deinit(FuriHalSerialIdUsart);
+    furi_hal_serial_deinit(handle);
+    furi_hal_serial_control_release(handle);
     text_box_set_text(app->text_box, furi_string_get_cstr(app->wifi_log));
 }
 
-static void ble_scan_tick(App* app) {
-    BleAdRecord rec;
-    if(furi_hal_bt_get_ad
-    infrared_worker_alloc();
-    infrared_worker_rx_set_received_signal_callback(
-        app->ir_worker, ir_received_callback, app);
-    infrared_worker_rx_start(app->ir_worker);
+typedef enum { MenuSubGHz, MenuInfrared, MenuWiFi } MenuIndex;
+
+static void scene_main_on_enter(void* context) {
+    App* app = context;
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "Signal Scanner");
+    submenu_add_item(app->submenu, "Sub-GHz",  MenuSubGHz,   NULL, app);
+    submenu_add_item(app->submenu, "Infrared", MenuInfrared, NULL, app);
+    submenu_add_item(app->submenu, "WiFi",     MenuWiFi,     NULL, app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewSubmenu);
 }
 
+static bool scene_main_on_event(void* context, SceneManagerEvent event) {
+    App* app = context;
+    if(event.type == SceneManagerEventTypeCustom) {
+        if(event.event == MenuSubGHz)
+            scene_manager_next_scene(app->scene_manager, SceneSubGHz);
+        else if(event.event == MenuInfrared)
+            scene_manager_next_scene(app->scene_manager, SceneInfrared);
+        else if(event.event == MenuWiFi)
+            scene_manager_next_scene(app->scene_manager, SceneWiFi);
+        return true;
+    }
+    return false;
+}
+static void scene_main_on_exit(void* context) { UNUSED(context); }
+
+static void scene_subghz_on_enter(void* context) {
+    App* app = context;
+    furi_string_reset(app->subghz_log);
+    furi_string_cat_str(app->subghz_log, "Sub-GHz Scanning\n433.92 MHz OOK\n\n");
+    text_box_set_text(app->text_box, furi_string_get_cstr(app->subghz_log));
+    text_box_set_font(app->text_box, TextBoxFontText);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewTextBox);
+    app->subghz_worker = subghz_worker_alloc();
+    subghz_worker_set_overrun_callback(app->subghz_worker, subghz_rx_callback, app);
+    furi_hal_subghz_reset();
+    furi_hal_subghz_load_preset(FuriHalSubGhzPresetOok650Async);
+    furi_hal_subghz_set_frequency_and_path(433920000);
+    subghz_worker_start(app->subghz_worker);
+}
+static bool scene_subghz_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context); UNUSED(event); return false;
+}
+static void scene_subghz_on_exit(void* context) {
+    App* app = context;
+    if(app->subghz_worker) {
+        subghz_worker_stop(app->subghz_worker);
+        subghz_worker_free(app->subghz_worker);
+        app->subghz_worker = NULL;
+    }
+    furi_hal_subghz_sleep();
+}
+
+static void scene_infrared_on_enter(void* context) {
+    App* app = context;
+    furi_string_reset(app->ir_log);
+    furi_string_cat_str(app->ir_log, "IR Scanning\nPoint remote at Flipper\n\n");
+    text_box_set_text(app->text_box, furi_string_get_cstr(app->ir_log));
+    text_box_set_font(app->text_box, TextBoxFontText);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewTextBox);
+    app->ir_worker = infrared_worker_alloc();
+    infrared_worker_rx_set_received_signal_callback(app->ir_worker, ir_received_callback, app);
+    infrared_worker_rx_start(app->ir_worker);
+}
 static bool scene_infrared_on_event(void* context, SceneManagerEvent event) {
     UNUSED(context); UNUSED(event); return false;
 }
-
 static void scene_infrared_on_exit(void* context) {
     App* app = context;
     if(app->ir_worker) {
@@ -143,65 +191,38 @@ static void scene_infrared_on_exit(void* context) {
     }
 }
 
-static void scene_ble_on_enter(void* context) {
-    App* app = context;
-    furi_string_reset(app->ble_log);
-    furi_string_cat_str(app->ble_log, "-- BLE Scanning --\n\n");
-    text_box_set_text(app->text_box, furi_string_get_cstr(app->ble_log));
-    text_box_set_font(app->text_box, TextBoxFontText);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ViewTextBox);
-    furi_hal_bt_start_adv_scan();
-}
-
-static bool scene_ble_on_event(void* context, SceneManagerEvent event) {
-    App* app = context;
-    UNUSED(event);
-    ble_scan_tick(app);
-    return false;
-}
-
-static void scene_ble_on_exit(void* context) {
-    UNUSED(context);
-    furi_hal_bt_stop_adv_scan();
-}
-
 static void scene_wifi_on_enter(void* context) {
     App* app = context;
     furi_string_reset(app->wifi_log);
-    furi_string_cat_str(app->wifi_log, "-- WiFi Scan --\nRequesting ESP32...\n");
+    furi_string_cat_str(app->wifi_log, "WiFi Scan\nRequesting ESP32...\n\n");
     text_box_set_text(app->text_box, furi_string_get_cstr(app->wifi_log));
     text_box_set_font(app->text_box, TextBoxFontText);
     view_dispatcher_switch_to_view(app->view_dispatcher, ViewTextBox);
     wifi_scan_start(app);
 }
-
 static bool scene_wifi_on_event(void* context, SceneManagerEvent event) {
     UNUSED(context); UNUSED(event); return false;
 }
-
 static void scene_wifi_on_exit(void* context) { UNUSED(context); }
 
 static const SceneManagerHandlers scene_handlers = {
     .on_enter_handlers = {
-        [SceneMain]      = scene_main_on_enter,
-        [SceneSubGHz]    = scene_subghz_on_enter,
-        [SceneInfrared]  = scene_infrared_on_enter,
-        [SceneBluetooth] = scene_ble_on_enter,
-        [SceneWiFi]      = scene_wifi_on_enter,
+        [SceneMain]     = scene_main_on_enter,
+        [SceneSubGHz]   = scene_subghz_on_enter,
+        [SceneInfrared] = scene_infrared_on_enter,
+        [SceneWiFi]     = scene_wifi_on_enter,
     },
     .on_event_handlers = {
-        [SceneMain]      = scene_main_on_event,
-        [SceneSubGHz]    = scene_subghz_on_event,
-        [SceneInfrared]  = scene_infrared_on_event,
-        [SceneBluetooth] = scene_ble_on_event,
-        [SceneWiFi]      = scene_wifi_on_event,
+        [SceneMain]     = scene_main_on_event,
+        [SceneSubGHz]   = scene_subghz_on_event,
+        [SceneInfrared] = scene_infrared_on_event,
+        [SceneWiFi]     = scene_wifi_on_event,
     },
     .on_exit_handlers = {
-        [SceneMain]      = scene_main_on_exit,
-        [SceneSubGHz]    = scene_subghz_on_exit,
-        [SceneInfrared]  = scene_infrared_on_exit,
-        [SceneBluetooth] = scene_ble_on_exit,
-        [SceneWiFi]      = scene_wifi_on_exit,
+        [SceneMain]     = scene_main_on_exit,
+        [SceneSubGHz]   = scene_subghz_on_exit,
+        [SceneInfrared] = scene_infrared_on_exit,
+        [SceneWiFi]     = scene_wifi_on_exit,
     },
     .scene_num = SceneCount,
 };
@@ -229,7 +250,6 @@ static App* app_alloc(void) {
     view_dispatcher_add_view(app->view_dispatcher, ViewTextBox, text_box_get_view(app->text_box));
     app->subghz_log = furi_string_alloc();
     app->ir_log     = furi_string_alloc();
-    app->ble_log    = furi_string_alloc();
     app->wifi_log   = furi_string_alloc();
     app->subghz_worker = NULL;
     app->ir_worker     = NULL;
@@ -245,7 +265,6 @@ static void app_free(App* app) {
     scene_manager_free(app->scene_manager);
     furi_string_free(app->subghz_log);
     furi_string_free(app->ir_log);
-    furi_string_free(app->ble_log);
     furi_string_free(app->wifi_log);
     free(app);
 }
