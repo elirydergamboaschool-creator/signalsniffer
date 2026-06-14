@@ -1,0 +1,19 @@
+App(
+    appid="signal_scanner",
+    name="Signal Scanner",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="signal_scanner_app",
+    requires=[
+        "gui",
+        "subghz",
+        "infrared",
+        "bt",
+    ],
+    stack_size=2 * 1024,
+    fap_category="Tools",
+    fap_version=(1, 0),
+    fap_description="Scan Sub-GHz, Infrared, Bluetooth & WiFi signals live.",
+    fap_author="YourName",
+    fap_weburl="",
+    fap_icon="icon.png",
+)
