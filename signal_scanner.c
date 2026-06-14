@@ -19,11 +19,10 @@ typedef struct {
     TextBox* log_box;
     FuriString* log;
     InfraredWorker* irw;
-    FuriTimer* timer;
-    bool scanning_subghz;
+    FuriTimer* scan_timer;
+    bool subghz_on;
 } App;
 
-// ── IR ───────────────────────────────────────────────────────────────────────
 static void ir_cb(void* ctx, InfraredWorkerSignal* sig) {
     App* app = ctx;
     char buf[64];
@@ -34,7 +33,8 @@ static void ir_cb(void* ctx, InfraredWorkerSignal* sig) {
             (unsigned long)m->address,
             (unsigned long)m->command);
     } else {
-        const uint32_t* t; size_t n;
+        const uint32_t* t;
+        size_t n;
         infrared_worker_get_raw_signal(sig, &t, &n);
         snprintf(buf, sizeof(buf), "[RAW] %zu pulses\n", n);
     }
@@ -43,10 +43,9 @@ static void ir_cb(void* ctx, InfraredWorkerSignal* sig) {
     text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
 }
 
-// ── SubGHz RSSI timer ────────────────────────────────────────────────────────
-static void subghz_timer_cb(void* ctx) {
+static void sgz_timer_cb(void* ctx) {
     App* app = ctx;
-    if(!app->scanning_subghz) return;
+    if(!app->subghz_on) return;
     float rssi = furi_hal_subghz_get_rssi();
     char buf[32];
     snprintf(buf, sizeof(buf), "RSSI: %.1f dBm\n", (double)rssi);
@@ -55,9 +54,104 @@ static void subghz_timer_cb(void* ctx) {
     text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
 }
 
-// ── Stop all scanning ────────────────────────────────────────────────────────
 static void stop_all(App* app) {
-    if(app->timer) {
-        furi_timer_stop(app->timer);
+    furi_timer_stop(app->scan_timer);
+    if(app->subghz_on) {
+        app->subghz_on = false;
+        furi_hal_subghz_sleep();
     }
-    if(app->scanning
+    if(app->irw) {
+        infrared_worker_rx_stop(app->irw);
+        infrared_worker_free(app->irw);
+        app->irw = NULL;
+    }
+}
+
+static void menu_cb(void* ctx, uint32_t idx) {
+    App* app = ctx;
+    stop_all(app);
+    furi_string_reset(app->log);
+    view_dispatcher_switch_to_view(app->vd, ViewLog);
+
+    if(idx == MenuSubGHz) {
+        furi_string_set_str(app->log, "Sub-GHz 433.92MHz\n\n");
+        text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
+        furi_hal_subghz_reset();
+        furi_hal_subghz_load_preset(FuriHalSubGhzPresetOok650Async);
+        furi_hal_subghz_set_frequency_and_path(433920000);
+        furi_hal_subghz_rx();
+        app->subghz_on = true;
+        furi_timer_start(app->scan_timer, furi_ms_to_ticks(500));
+
+    } else if(idx == MenuInfrared) {
+        furi_string_set_str(app->log, "IR Scanning\nPoint remote here\n\n");
+        text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
+        app->irw = infrared_worker_alloc();
+        infrared_worker_rx_set_received_signal_callback(app->irw, ir_cb, app);
+        infrared_worker_rx_start(app->irw);
+
+    } else if(idx == MenuWiFi) {
+        furi_string_set_str(app->log, "WiFi Scan\nContacting ESP32...\n\n");
+        text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
+        FuriHalSerialHandle* h = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
+        if(!h) {
+            furi_string_cat_str(app->log, "No serial - check WiFi board\n");
+        } else {
+            furi_hal_serial_init(h, 115200);
+            furi_hal_serial_tx(h, (const uint8_t*)"SCAN\n", 5);
+            furi_delay_ms(3000);
+            furi_hal_serial_deinit(h);
+            furi_hal_serial_control_release(h);
+            furi_string_cat_str(app->log, "Scan sent!\n");
+        }
+        text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
+    }
+}
+
+static bool back_cb(void* ctx) {
+    App* app = ctx;
+    stop_all(app);
+    view_dispatcher_switch_to_view(app->vd, ViewMenu);
+    return true;
+}
+
+int32_t signal_scanner_app(void* p) {
+    UNUSED(p);
+    App* app = malloc(sizeof(App));
+    app->irw = NULL;
+    app->subghz_on = false;
+    app->log = furi_string_alloc();
+    app->scan_timer = furi_timer_alloc(sgz_timer_cb, FuriTimerTypePeriodic, app);
+
+    app->vd = view_dispatcher_alloc();
+    view_dispatcher_set_event_callback_context(app->vd, app);
+    view_dispatcher_set_navigation_event_callback(app->vd, back_cb);
+
+    app->menu = submenu_alloc();
+    submenu_set_header(app->menu, "Signal Scanner");
+    submenu_add_item(app->menu, "Sub-GHz",  MenuSubGHz,   menu_cb, app);
+    submenu_add_item(app->menu, "Infrared", MenuInfrared, menu_cb, app);
+    submenu_add_item(app->menu, "WiFi",     MenuWiFi,     menu_cb, app);
+    view_dispatcher_add_view(app->vd, ViewMenu, submenu_get_view(app->menu));
+
+    app->log_box = text_box_alloc();
+    text_box_set_font(app->log_box, TextBoxFontText);
+    view_dispatcher_add_view(app->vd, ViewLog, text_box_get_view(app->log_box));
+
+    Gui* gui = furi_record_open(RECORD_GUI);
+    view_dispatcher_attach_to_gui(app->vd, gui, ViewDispatcherTypeFullscreen);
+    view_dispatcher_switch_to_view(app->vd, ViewMenu);
+    view_dispatcher_run(app->vd);
+
+    stop_all(app);
+    furi_timer_free(app->scan_timer);
+    view_dispatcher_remove_view(app->vd, ViewMenu);
+    view_dispatcher_remove_view(app->vd, ViewLog);
+    submenu_free(app->menu);
+    text_box_free(app->log_box);
+    view_dispatcher_free(app->vd);
+    furi_string_free(app->log);
+    furi_record_close(RECORD_GUI);
+    free(app);
+    return 0;
+}
