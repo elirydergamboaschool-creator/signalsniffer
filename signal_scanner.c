@@ -4,14 +4,13 @@
 #include <gui/modules/submenu.h>
 #include <gui/modules/text_box.h>
 #include <infrared_worker.h>
-#include <furi_hal_subghz.h>
 #include <furi_hal_serial.h>
 #include <furi_hal_serial_control.h>
 #include <string.h>
 #include <stdio.h>
 
 typedef enum { ViewMenu, ViewLog } AppView;
-typedef enum { MenuSubGHz, MenuInfrared, MenuWiFi } MenuItem;
+typedef enum { MenuInfrared, MenuWiFi } MenuItem;
 
 typedef struct {
     ViewDispatcher* vd;
@@ -19,8 +18,6 @@ typedef struct {
     TextBox* log_box;
     FuriString* log;
     InfraredWorker* irw;
-    FuriTimer* scan_timer;
-    bool subghz_on;
 } App;
 
 static void ir_cb(void* ctx, InfraredWorkerSignal* sig) {
@@ -43,23 +40,7 @@ static void ir_cb(void* ctx, InfraredWorkerSignal* sig) {
     text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
 }
 
-static void sgz_timer_cb(void* ctx) {
-    App* app = ctx;
-    if(!app->subghz_on) return;
-    float rssi = furi_hal_subghz_get_rssi();
-    char buf[32];
-    snprintf(buf, sizeof(buf), "RSSI: %.1f dBm\n", (double)rssi);
-    furi_string_cat_str(app->log, buf);
-    if(furi_string_size(app->log) > 2048) furi_string_left(app->log, 2048);
-    text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
-}
-
 static void stop_all(App* app) {
-    furi_timer_stop(app->scan_timer);
-    if(app->subghz_on) {
-        app->subghz_on = false;
-        furi_hal_subghz_sleep();
-    }
     if(app->irw) {
         infrared_worker_rx_stop(app->irw);
         infrared_worker_free(app->irw);
@@ -73,17 +54,7 @@ static void menu_cb(void* ctx, uint32_t idx) {
     furi_string_reset(app->log);
     view_dispatcher_switch_to_view(app->vd, ViewLog);
 
-    if(idx == MenuSubGHz) {
-        furi_string_set_str(app->log, "Sub-GHz 433.92MHz\n\n");
-        text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
-        furi_hal_subghz_reset();
-        furi_hal_subghz_load_preset(FuriHalSubGhzPresetOok650Async);
-        furi_hal_subghz_set_frequency_and_path(433920000);
-        furi_hal_subghz_rx();
-        app->subghz_on = true;
-        furi_timer_start(app->scan_timer, furi_ms_to_ticks(500));
-
-    } else if(idx == MenuInfrared) {
+    if(idx == MenuInfrared) {
         furi_string_set_str(app->log, "IR Scanning\nPoint remote here\n\n");
         text_box_set_text(app->log_box, furi_string_get_cstr(app->log));
         app->irw = infrared_worker_alloc();
@@ -119,9 +90,7 @@ int32_t signal_scanner_app(void* p) {
     UNUSED(p);
     App* app = malloc(sizeof(App));
     app->irw = NULL;
-    app->subghz_on = false;
     app->log = furi_string_alloc();
-    app->scan_timer = furi_timer_alloc(sgz_timer_cb, FuriTimerTypePeriodic, app);
 
     app->vd = view_dispatcher_alloc();
     view_dispatcher_set_event_callback_context(app->vd, app);
@@ -129,7 +98,6 @@ int32_t signal_scanner_app(void* p) {
 
     app->menu = submenu_alloc();
     submenu_set_header(app->menu, "Signal Scanner");
-    submenu_add_item(app->menu, "Sub-GHz",  MenuSubGHz,   menu_cb, app);
     submenu_add_item(app->menu, "Infrared", MenuInfrared, menu_cb, app);
     submenu_add_item(app->menu, "WiFi",     MenuWiFi,     menu_cb, app);
     view_dispatcher_add_view(app->vd, ViewMenu, submenu_get_view(app->menu));
@@ -144,7 +112,6 @@ int32_t signal_scanner_app(void* p) {
     view_dispatcher_run(app->vd);
 
     stop_all(app);
-    furi_timer_free(app->scan_timer);
     view_dispatcher_remove_view(app->vd, ViewMenu);
     view_dispatcher_remove_view(app->vd, ViewLog);
     submenu_free(app->menu);
